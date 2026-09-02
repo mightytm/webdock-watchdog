@@ -1,0 +1,48 @@
+name: webdock-watchdog
+
+# Поднимает VPS обратно, если хост его погасил.
+# Секрет WEBDOCK_TOKEN: Settings -> Secrets and variables -> Actions -> New repository secret
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'   # каждые 5 минут (GitHub может задержать запуск)
+  workflow_dispatch:        # кнопка "Run workflow" для ручной проверки
+
+permissions: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check status and start if stopped
+        env:
+          WEBDOCK_TOKEN: ${{ secrets.WEBDOCK_TOKEN }}
+          SLUG: claudemain
+        run: |
+          set -euo pipefail
+
+          api() {
+            curl -sS --fail-with-body --retry 2 --retry-delay 5 --max-time 30 \
+                 -H "Authorization: Bearer $WEBDOCK_TOKEN" "$@"
+          }
+
+          status=$(api "https://api.webdock.io/v1/servers/$SLUG" | jq -r '.status')
+          echo "Server $SLUG status: $status"
+
+          case "$status" in
+            running)
+              echo "OK, ничего делать не нужно."
+              ;;
+            stopped)
+              echo "::warning::Сервер выключен - отправляю start"
+              api -X POST "https://api.webdock.io/v1/servers/$SLUG/actions/start"
+              echo "::notice::Команда start отправлена"
+              ;;
+            *)
+              # provisioning / rebooting / suspended / error - не трогаем,
+              # но роняем job, чтобы GitHub прислал письмо
+              echo "::error::Неожиданный статус: $status"
+              exit 1
+              ;;
+          esac
