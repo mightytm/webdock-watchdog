@@ -1,14 +1,27 @@
 name: webdock-watchdog
 
-# Поднимает VPS обратно, если хост его погасил.
-# Секрет WEBDOCK_TOKEN: Settings -> Secrets and variables -> Actions -> New repository secret
+# Поднимает VPS обратно, если хост его погасил, и пишет об этом в Telegram.
+# Секреты (Settings -> Secrets and variables -> Actions):
+#   WEBDOCK_TOKEN      - токен Webdock, права Servers: Read/Write
+#   TELEGRAM_BOT_TOKEN - тот же бот, что и у плагина Claude Code на сервере
+#   TELEGRAM_CHAT_ID   - id личного чата с ботом
 
 on:
   schedule:
     - cron: '*/5 * * * *'   # каждые 5 минут (GitHub может задержать запуск)
-  workflow_dispatch:        # кнопка "Run workflow" для ручной проверки
+  workflow_dispatch:
+    inputs:
+      test:
+        description: 'Отправить тестовое сообщение в Telegram'
+        type: boolean
+        default: false
 
 permissions: {}
+
+env:
+  SLUG: claudemain
+  TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+  TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
 
 jobs:
   check:
@@ -18,14 +31,27 @@ jobs:
       - name: Check status and start if stopped
         env:
           WEBDOCK_TOKEN: ${{ secrets.WEBDOCK_TOKEN }}
-          SLUG: claudemain
+          TEST: ${{ inputs.test }}
         run: |
           set -euo pipefail
+
+          tg() {
+            [ -n "${TG_TOKEN:-}" ] || return 0
+            curl -sS --max-time 20 -o /dev/null \
+                 -X POST "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
+                 --data-urlencode "chat_id=$TG_CHAT" \
+                 --data-urlencode "text=$1" \
+              || echo "::warning::не удалось отправить сообщение в Telegram"
+          }
 
           api() {
             curl -sS --fail-with-body --retry 2 --retry-delay 5 --max-time 30 \
                  -H "Authorization: Bearer $WEBDOCK_TOKEN" "$@"
           }
+
+          if [ "${TEST:-false}" = "true" ]; then
+            tg "🔧 Проверка связи: watchdog сервера $SLUG на месте и умеет писать сюда."
+          fi
 
           status=$(api "https://api.webdock.io/v1/servers/$SLUG" | jq -r '.status')
           echo "Server $SLUG status: $status"
@@ -36,13 +62,28 @@ jobs:
               ;;
             stopped)
               echo "::warning::Сервер выключен - отправляю start"
+              tg "🔴 Сервер $SLUG выключен. Отправляю команду на запуск."
               api -X POST "https://api.webdock.io/v1/servers/$SLUG/actions/start"
               echo "::notice::Команда start отправлена"
+              tg "🟢 Команда на запуск $SLUG отправлена. Через пару минут проверьте, что всё поднялось."
               ;;
             *)
               # provisioning / rebooting / suspended / error - не трогаем,
-              # но роняем job, чтобы GitHub прислал письмо
+              # но роняем job, чтобы пришло уведомление
               echo "::error::Неожиданный статус: $status"
+              tg "⚠️ Сервер $SLUG в статусе «$status». Сам ничего не делаю - посмотрите в панели Webdock."
+              echo "notified=1" >> "$GITHUB_ENV"
               exit 1
               ;;
           esac
+
+      - name: Notify on failure
+        # env.notified стоит, если про проблему уже написали выше - не дублируем
+        if: failure() && env.notified != '1'
+        run: |
+          [ -n "${TG_TOKEN:-}" ] || exit 0
+          curl -sS --max-time 20 -o /dev/null \
+               -X POST "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
+               --data-urlencode "chat_id=$TG_CHAT" \
+               --data-urlencode "text=❌ Watchdog не смог проверить сервер $SLUG. Обычно это истёкший токен Webdock или сбой их API. Лог: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            || true
